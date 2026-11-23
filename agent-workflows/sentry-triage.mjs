@@ -69,11 +69,19 @@ function visible(text) {
 // GitHub.
 export function scrub(text) {
   return String(text ?? "")
-    .replace(/https?:\/\/[^\s"'<>)]+/g, redactUrl)
+    // Any scheme, any case, and protocol-relative //host links.
+    .replace(/(?:\b[a-z][a-z0-9+.-]*:)?\/\/[^\s"'<>)]+/gi, redactUrl)
     // A link written without a scheme keeps only its host, like redactUrl.
-    .replace(/(?<![\w/.@-])((?:[a-z0-9-]+\.)+[a-z]{2,})\/[^\s"'<>)]*/gi, "$1")
+    .replace(/(?<![\w/.@:-])((?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?\/[^\s"'<>)]*/gi, "$1")
     .replace(/\b(bearer)\s+[^\s"']+/gi, "$1 [redacted]")
-    .replace(/\b(token|access_token|refresh_token|api[_-]?key|apikey|key|secret|password|signature)(\s*[=:]\s*)[^\s"'&,;]+/gi, "$1$2[redacted]")
+    // Basic and Digest credentials are base64-ish, so they carry a digit or
+    // padding; that keeps ordinary words after "basic" readable.
+    .replace(/\b(basic|digest)\s+(?=[\w+/=.-]*[\d=+/])[\w+/=.-]{8,}/gi, "$1 [redacted]")
+    // key=value, key: value and JSON or JS objects with quoted keys or values.
+    .replace(
+      /(["']?)\b(token|access_token|refresh_token|api[_-]?key|apikey|key|secret|password|signature)\1(\s*[=:]\s*)(?:(["'])[^"']*\4|[^\s"'&,;]+)/gi,
+      (_, q, key, sep, quote = "") => `${q}${key}${q}${sep}${quote}[redacted]${quote}`,
+    )
     .replace(/eyJ[\w-]*\.[\w-]+\.[\w-]+/g, "[jwt]")
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "[uuid]")
     // 32+ characters mixing letters and digits: keys and signatures, not names.
@@ -91,7 +99,9 @@ export function scrub(text) {
 // a signed storage path. Query strings never survive.
 export function redactUrl(url) {
   try {
-    const parsed = new URL(url);
+    const parsed = new URL(url.startsWith("//") ? `https:${url}` : url);
+    // Other schemes have an opaque origin ("null"), so keep scheme and host.
+    if (!["http:", "https:"].includes(parsed.protocol)) return `${parsed.protocol}//${parsed.hostname}`;
     if (!parsed.hostname.endsWith(".supabase.co")) return parsed.origin;
     const parts = parsed.pathname.split("/");
     return `${parsed.origin}${parts.slice(0, parts[3] === "rpc" ? 5 : 4).join("/")}`;

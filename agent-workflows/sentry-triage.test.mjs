@@ -119,6 +119,22 @@ test("scrubs tokens that are not inside a full URL", () => {
   assert.match(out, /token=\[redacted\]/);
 });
 
+test("scrubs quoted secrets, any auth scheme and every URL spelling", () => {
+  const out = scrub(
+    [
+      `{"password": "hunter2xyz", 'api_key':'k-123'}`,
+      "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+      "HTTPS://Evil.Example/path/secret-a?x=1",
+      "//cdn.example.com/secret-b/file",
+      "ftp://files.example.com/secret-c",
+      "files.example.com:8443/secret-d",
+    ].join("\n"),
+  );
+  assert.doesNotMatch(out, /hunter2xyz|k-123|dXNlcjpw|secret-[a-d]/);
+  assert.match(out, /"password": "\[redacted\]"/);
+  assert.match(out, /Basic \[redacted\]/);
+});
+
 test("keeps only the endpoint of a Supabase path", () => {
   assert.equal(redactUrl("https://x.supabase.co/rest/v1/tribe_members?user_id=eq.1"), "https://x.supabase.co/rest/v1/tribe_members");
   assert.equal(redactUrl("https://x.supabase.co/storage/v1/object/sign/avatars/abc/photo.jpg"), "https://x.supabase.co/storage/v1/object");
