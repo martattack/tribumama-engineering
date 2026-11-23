@@ -1,0 +1,548 @@
+name: Claude implements issue
+
+# When a maintainer labels an issue `agent:accepted`, Claude Code implements it
+# with the `implement-issue` skill and opens a DRAFT pull request. It never
+# merges: a human tests the branch locally and iterates before merging, since a
+# merge to main deploys migrations and edge functions to production.
+#
+# `main` cannot be protected on the current GitHub plan, so this workflow is
+# what keeps the agent off it. The agent runs in `implement` with a read-only
+# token and cannot push or comment, and its commands run in a sandbox with no
+# network and no tokens in their env. Its commits and the text it wants posted
+# leave that job as an artifact; `deliver`, a job with no model and a fresh
+# checkout, checks the branch name, the changed paths and every commit and text
+# for credentials, then pushes, opens the draft PR and posts the comments.
+#
+# A pushed branch also reaches Vercel, which builds previews from it. vercel.json
+# turns that off for claude/** and deliver refuses a branch whose Vercel config
+# differs from main,
+# so no agent code runs anywhere before a person has read it.
+
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: claude-implement-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  # The issue body reaches the agent, so only maintainers' issues run, plus
+  # the ones sentry-triage files (they are meant to be implementable). Other
+  # workflows open issues as github-actions[bot] too, so the bot's issues
+  # also need the source:sentry label.
+  refuse:
+    if: >-
+      github.event.label.name == 'agent:accepted' && github.event.issue.state == 'open' &&
+      !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association) &&
+      !(github.event.issue.user.login == 'github-actions[bot]' &&
+      contains(github.event.issue.labels.*.name, 'source:sentry'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Tell the issue why the agent will not run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body "La implementación automática solo se ejecuta en issues abiertas por mantenedores del repo o por la automatización de Sentry. Para implementar esta, abre una issue nueva con el contenido revisado y ponle la etiqueta \`agent:accepted\`."
+
+  implement:
+    if: >-
+      github.event.label.name == 'agent:accepted' && github.event.issue.state == 'open' &&
+      (contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association) ||
+      (github.event.issue.user.login == 'github-actions[bot]' &&
+      contains(github.event.issue.labels.*.name, 'source:sentry')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # The agent runs code shaped by issue text, which can come from users (via
+    # Sentry). It must never write a cache that main's deploys later restore.
+    cache-mode: none
+    # Read only: whatever runs here (the agent, the tests it writes, any npm
+    # script) can read this token, so it cannot push, comment or edit an issue
+    # (an edited maintainer issue would pass the gate above on a later run).
+    # The agent writes its comments to files and deliver posts them.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      actions: read
+    outputs:
+      has_files: ${{ steps.package.outputs.has_files }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.13.0
+          package-manager-cache: false
+
+      # Installed up front so the agent spends its turns on the task, not setup,
+      # and because its commands have no network (see the sandbox below). The
+      # npx call fills the cache `migration new` runs from: the agent's own npm
+      # cache, which nothing outside the sandbox reads once Claude starts, so
+      # the sandbox can write it without reaching code that runs unsandboxed.
+      - name: Install dependencies
+        env:
+          npm_config_cache: /tmp/agent-npm
+        run: |
+          npm ci
+          npx --yes supabase@2.106.0 --version
+
+      # Claude Code's sandbox needs bubblewrap and socat, and Ubuntu 24.04
+      # blocks the unprivileged user namespaces bubblewrap uses. The same setup
+      # claude-code-action does for its own isolation. No continue-on-error: a
+      # run without the sandbox must not start.
+      - name: Install the sandbox for the agent's commands
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::Could not install bubblewrap and socat for the sandbox."
+              exit 1
+            fi
+            sleep 10
+          done
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      # The issue goes to a gitignored file instead of the prompt: its text is
+      # untrusted data, and this keeps it out of the instructions and out of
+      # shell expansion. The title, labels and body come from the event, so the
+      # agent sees the issue as it was when someone applied the label, not a
+      # later edit. Only maintainers' comments are kept. Run files live in
+      # .agent-run/ because Claude Code treats .claude/ as protected.
+      - name: Save the issue for Claude
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          mkdir -p .agent-run
+          jq -r '.issue | "# #\(.number) \(.title)\n\nLabels: \([.labels[].name] | join(", "))\n\n\(.body // "")\n\n## Comments from maintainers\n"' \
+            "$GITHUB_EVENT_PATH" > .agent-run/issue.md
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$ISSUE/comments?per_page=100" \
+            --jq '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | "### \(.user.login)\n\(.body)\n"' \
+            >> .agent-run/issue.md
+          # The agent has no network to check which branch names are taken.
+          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/claude/issue-$ISSUE-" \
+            --jq '.[].ref | sub("^refs/heads/"; "")' > .agent-run/existing-branches.txt
+
+      # Fail fast with a clear message instead of a cryptic auth error later.
+      - name: Check the Claude token secret is set
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Missing repository secret CLAUDE_CODE_OAUTH_TOKEN. Generate it with 'claude setup-token' and add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      # 1.0.271 or later: it bundles Claude Code 2.1.322, the first to refuse a
+      # .git/commondir planted by a sandboxed command before Claude's own
+      # (unsandboxed) git calls read it.
+      - name: Implement with Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@4845bacbb38b3c4b15d948f035349786f678e068 # v1.0.267
+        env:
+          # Opt out of plugin skill-usage telemetry.
+          DO_NOT_TRACK: "1"
+          # Headless runs end when Claude ends its turn, which kills anything
+          # still running in the background. Keep agents and commands in the
+          # foreground so Claude waits for them.
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+          # Strips credentials from the env of every command Claude runs and
+          # puts them in their own PID namespace, so a command cannot read the
+          # OAuth token from Claude's /proc/<pid>/environ.
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+          TURBO_TELEMETRY_DISABLED: "1"
+          npm_config_cache: /tmp/agent-npm
+          npm_config_update_notifier: "false"
+        with:
+          # Billed to the Claude subscription of whoever ran `claude setup-token`.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The action writes this token into the origin URL and the agent's
+          # environment, so it must be this job's read-only token. Without it
+          # the action fetches the Claude GitHub App token, which can push.
+          github_token: ${{ github.token }}
+          # Method comes from maintained plugins; the repo skill only adds
+          # this repo's rules and the PR format. Plugin MCP servers (expo,
+          # supabase) are not in allowedTools, so they never touch prod.
+          # The marketplace is ours, read from main: each plugin is pinned to
+          # the commit the official catalog pinned, so this job never runs
+          # plugin code nobody has reviewed. Bump with
+          # `npm run skills:bump -- plugins`.
+          plugin_marketplaces: ./.claude/marketplace
+          plugins: |
+            superpowers@tribu-pinned
+            feature-dev@tribu-pinned
+            pr-review-toolkit@tribu-pinned
+            expo@tribu-pinned
+            supabase@tribu-pinned
+          prompt: "/implement-issue ${{ github.event.issue.number }}"
+          # Print the conversation in the job log, so a run that ends early
+          # can be diagnosed without downloading the transcript artifact.
+          show_full_output: true
+          # The agent edits code and runs the tests, so treat code execution in
+          # this job as certain: the npm/npx allowlist only stops a script
+          # being approved by name, not a test that runs anything. What keeps
+          # main safe is that nothing here can write to GitHub (the deliver job
+          # pushes). The Read denies keep the agent's own tools off runner
+          # internals and the credential files in home; the rest of home stays
+          # readable because the plugin skills read their own files from
+          # ~/.claude/plugins.
+          #
+          # Every Bash command runs in Claude Code's sandbox with no network
+          # (an empty allowlist that is strict, so nothing is asked), without
+          # the tokens in its env and without the credential and runner paths
+          # below, so code the agent runs cannot send the OAuth token out.
+          # It fails closed: Claude refuses to start, and never runs a command
+          # outside it. The allowlist still decides which commands run at all.
+          # Writes stay in the checkout and /tmp, minus the git files the later
+          # steps read. Paths that do not exist yet may not be enforced on
+          # Linux, so the packaging step checks for them too. The credential denylist covers every secret-bearing
+          # variable the action sets, including ALL_INPUTS, which holds all its
+          # inputs (the OAuth token too) as JSON.
+          # The Read, Edit and Write tools and MCP servers are not sandboxed;
+          # their rules are the permission ones in claude_args.
+          settings: |
+            {
+              "sandbox": {
+                "enabled": true,
+                "failIfUnavailable": true,
+                "allowUnsandboxedCommands": false,
+                "autoAllowBashIfSandboxed": false,
+                "network": { "allowedDomains": [], "strictAllowlist": true },
+                "filesystem": {
+                  "allowWrite": ["/tmp"],
+                  "denyWrite": [
+                    "${{ github.workspace }}/.git/config", "${{ github.workspace }}/.git/hooks",
+                    "${{ github.workspace }}/.git/info", "${{ github.workspace }}/.git/commondir",
+                    "${{ github.workspace }}/.git/config.worktree", "${{ github.workspace }}/.git/worktrees",
+                    "${{ github.workspace }}/.git/modules"
+                  ],
+                  "denyRead": [
+                    "~/.claude.json", "~/.claude/.credentials.json", "~/.ssh", "~/.gnupg",
+                    "~/.docker", "~/.aws", "~/.azure", "~/.kube", "~/.npmrc",
+                    "~/.git-credentials", "~/.netrc", "~/.config/gh",
+                    "/home/runner/runners", "/home/runner/work/_temp", "/home/runner/work/_actions"
+                  ]
+                },
+                "credentials": {
+                  "envVars": [
+                    { "name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny" },
+                    { "name": "ANTHROPIC_API_KEY", "mode": "deny" },
+                    { "name": "GITHUB_TOKEN", "mode": "deny" },
+                    { "name": "GH_TOKEN", "mode": "deny" },
+                    { "name": "ACTIONS_RUNTIME_TOKEN", "mode": "deny" },
+                    { "name": "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "mode": "deny" },
+                    { "name": "ALL_INPUTS", "mode": "deny" },
+                    { "name": "OVERRIDE_GITHUB_TOKEN", "mode": "deny" },
+                    { "name": "DEFAULT_WORKFLOW_TOKEN", "mode": "deny" },
+                    { "name": "SSH_SIGNING_KEY", "mode": "deny" },
+                    { "name": "AWS_SECRET_ACCESS_KEY", "mode": "deny" },
+                    { "name": "AWS_SESSION_TOKEN", "mode": "deny" },
+                    { "name": "AWS_BEARER_TOKEN_BEDROCK", "mode": "deny" },
+                    { "name": "ANTHROPIC_CUSTOM_HEADERS", "mode": "deny" },
+                    { "name": "OTEL_EXPORTER_OTLP_HEADERS", "mode": "deny" }
+                  ]
+                }
+              }
+            }
+          claude_args: |
+            --model opus
+            --max-turns 200
+            --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,Skill,Task,Agent,TodoWrite,TaskCreate,TaskUpdate,TaskList,TaskGet,Bash(npm run typecheck),Bash(npm run typecheck *),Bash(npm run lint),Bash(npm run lint *),Bash(npm run test),Bash(npm run test *),Bash(npx turbo test),Bash(npx turbo test *),Bash(npx jest *),Bash(npx eslint *),Bash(npx --yes supabase@2.106.0 migration new *),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git switch:*),Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git rev-parse:*),Bash(git branch:*),Bash(ls:*),Bash(mkdir:*),mcp__github__list_pull_requests"
+            --disallowedTools "Edit(.github/**),Write(.github/**),Edit(.git/**),Write(.git/**),Edit(.env*),Write(.env*),Edit(eas.json),Write(eas.json),Edit(**/vercel.*),Write(**/vercel.*),Edit(**/.vercel/**),Write(**/.vercel/**),Edit(**/.claude/settings*.json),Write(**/.claude/settings*.json),Read(//proc/**),Read(//sys/**),Read(//home/runner/runners/**),Read(//home/runner/work/_temp/**),Read(//home/runner/work/_actions/**),Read(~/.ssh/**),Read(~/.gnupg/**),Read(~/.config/**),Read(~/.docker/**),Read(~/.aws/**),Read(~/.azure/**),Read(~/.kube/**),Read(~/.npmrc),Read(~/.gitconfig),Read(~/.git-credentials),Read(~/.netrc),Read(~/.claude.json),Read(~/.claude/.credentials.json),Bash(npm run skills:*),Bash(git push),Bash(git push *),Bash(git fetch),Bash(git fetch *),Bash(git remote *),Bash(git config *),mcp__github__create_pull_request,mcp__github__add_issue_comment"
+
+      # Everything after the agent in this job is treated as tainted (it could
+      # have changed git config, PATH or this job's env files), which is why
+      # the bundle and the texts are only data to the deliver job and are
+      # checked there.
+      - name: Package the agent's branch and texts
+        id: package
+        if: always() && steps.claude.outcome != 'skipped'
+        # The agent could have planted git config or a .git/commondir pointing
+        # at config of its own. So git here takes its directories from the env
+        # (which overrides commondir), ignores hooks and fsmonitor, and reads no
+        # global or system config; a planted redirect stops the delivery; and
+        # .git is deleted on exit so no later step (checkout's cleanup) runs
+        # git on it.
+        env:
+          GIT_DIR: ${{ github.workspace }}/.git
+          GIT_COMMON_DIR: ${{ github.workspace }}/.git
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: |
+          trap 'rm -rf "$GIT_DIR"' EXIT
+          for f in commondir config.worktree worktrees modules gitdir; do
+            if [ -e "$GIT_DIR/$f" ] || [ -L "$GIT_DIR/$f" ]; then
+              echo "::error::The agent's run left .git/$f, which redirects git. Nothing is delivered."
+              exit 1
+            fi
+          done
+          git() { command git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+          out="$RUNNER_TEMP/delivery"
+          mkdir -p "$out/text"
+          for f in pr-title.txt pr.md issue-comment.md stop.md; do
+            if [ -f ".agent-run/$f" ]; then
+              cp ".agent-run/$f" "$out/text/"
+              echo "has_files=true" >> "$GITHUB_OUTPUT"
+            fi
+          done
+          branch=$(git symbolic-ref --quiet --short HEAD || true)
+          if [ -z "$branch" ] || [ "$branch" = main ]; then
+            echo "No agent branch is checked out, so there is no branch to deliver."
+            exit 0
+          fi
+          if [ "$(git rev-list --count "origin/main..refs/heads/$branch")" -eq 0 ]; then
+            echo "The agent branch has no commits beyond main."
+            exit 0
+          fi
+          printf '%s\n' "$branch" > "$out/branch.txt"
+          git bundle create "$out/branch.bundle" "refs/heads/$branch" ^origin/main
+          echo "has_files=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.package.outputs.has_files == 'true'
+        with:
+          name: agent-delivery
+          path: ${{ runner.temp }}/delivery/
+          retention-days: 7
+          # "Re-run failed jobs" uploads again into the same run.
+          overwrite: true
+
+      # Kept for a week so a failed or empty run can be diagnosed.
+      - name: Upload the Claude transcript
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: claude-transcript-issue-${{ github.event.issue.number }}
+          path: ${{ runner.temp }}/claude-execution-output.json
+          retention-days: 7
+          if-no-files-found: ignore
+          overwrite: true
+
+  # No model and no npm here: the only write token in this workflow lives in
+  # this job, and nothing from the agent runs in it. Also runs after a failed
+  # agent run, so finished commits are not lost.
+  deliver:
+    needs: implement
+    if: ${{ !cancelled() && needs.implement.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    cache-mode: none
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.implement.outputs.has_files == 'true'
+        with:
+          name: agent-delivery
+          path: ${{ runner.temp }}/delivery
+
+      # Same pinned binary and checksum as CI's `secrets` job, so no
+      # third-party action runs next to this job's write token.
+      - name: Install gitleaks
+        if: needs.implement.outputs.has_files == 'true'
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+
+      # Every check runs before anything is published, with no token in
+      # reach. Code the agent ran could read the job's tokens, so the commits
+      # and every text are scanned, and a pushed draft never waits for CI
+      # (which skips drafts) to catch a leak. The branch name is fixed by the
+      # skill: claude/issue-<n>-<slug>, slug at most 60 characters, plus -rN
+      # on a retry.
+      - name: Check the agent's delivery
+        id: check
+        if: needs.implement.outputs.has_files == 'true'
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+          DIR: ${{ runner.temp }}/delivery
+        run: |
+          # The agent writes what is scanned, so inline gitleaks:allow
+          # comments are ignored, and literal() backs gitleaks up for the two
+          # tokens this run's code could read: gitleaks' default allowlist
+          # skips lockfiles and images, and the grep skips nothing.
+          scan() { "$RUNNER_TEMP/gitleaks" "$@" --config .gitleaks.toml --ignore-gitleaks-allow --redact --verbose --no-banner --exit-code 1; }
+          literal() { grep -rqaE 'sk-ant-[a-z]{3,6}[0-9]{2}-|gh[pousr]_[A-Za-z0-9]{20,}' "$@"; }
+          if [ -d "$DIR/text" ] && { ! scan dir "$DIR/text" || literal "$DIR/text"; }; then
+            echo "::error::Refusing to push: the agent's PR or issue text contains something shaped like a credential."
+            exit 1
+          fi
+          if [ -s "$DIR/text/stop.md" ]; then echo "has_stop=true" >> "$GITHUB_OUTPUT"; fi
+          if [ ! -f "$DIR/branch.txt" ]; then
+            echo "The agent left no branch to push."
+            exit 0
+          fi
+          branch=$(head -n 1 "$DIR/branch.txt")
+          pattern="^claude/issue-${ISSUE}-[a-z0-9][a-z0-9-]{0,59}(-r[0-9]{1,2})?$"
+          if ! [[ "$branch" =~ $pattern ]]; then
+            echo "::error::Refusing to push: the agent branch is not named claude/issue-$ISSUE-<slug>."
+            exit 1
+          fi
+          bundle="$DIR/branch.bundle"
+          git bundle verify --quiet "$bundle"
+          heads=$(git bundle list-heads "$bundle" | awk '{print $2}')
+          if [ "$heads" != "refs/heads/$branch" ]; then
+            echo "::error::Refusing to push: the bundle must carry exactly one ref, the agent branch."
+            exit 1
+          fi
+          git fetch --no-tags --quiet "$bundle" "refs/heads/$branch:refs/agent/head"
+          # Net change plus every commit, so a change undone later still counts.
+          # A pathspec instead of grepping names: git quotes unusual paths
+          # ("\303..."), which a '^\.github/' match would miss, and
+          # --no-renames keeps a move out of a protected path from hiding its
+          # old path. Captured first: a failing git (no shared history) stops
+          # the step.
+          vercel=(':(glob)**/vercel.*' ':(glob)**/.vercel/**')
+          net=$(git diff --no-renames --name-only origin/main...refs/agent/head -- .github "${vercel[@]}")
+          each=$(git log --no-renames --full-history --format=%H origin/main..refs/agent/head -- .github "${vercel[@]}")
+          # Vercel reads its config from the pushed commit, both whether to
+          # build and how, so the tip must carry exactly the config of the main
+          # the agent started from (GITHUB_SHA, which both jobs check out). Two
+          # dots: a branch cut from an older commit (without the claude/**
+          # block) shows no change against its own base but differs here. Not
+          # origin/main, which may have changed its Vercel config since.
+          tip=$(git diff --no-renames --name-only "$GITHUB_SHA" refs/agent/head -- "${vercel[@]}")
+          if [ -n "$net$each$tip" ]; then
+            echo "::error::Refusing to push: the agent branch changes .github/ or the Vercel config, or does not carry main's Vercel config."
+            exit 1
+          fi
+          # The agent never needs a merge, and git log -p shows no diff for
+          # one, so a merge could carry content past the literal check.
+          if [ -n "$(git rev-list --min-parents=2 origin/main..refs/agent/head)" ]; then
+            echo "::error::Refusing to push: the agent branch contains a merge commit."
+            exit 1
+          fi
+          # Raw format keeps the message, author and committer in the patch,
+          # which gitleaks' git scan does not read.
+          git log -p --text --format=raw origin/main..refs/agent/head > "$RUNNER_TEMP/agent.patch"
+          if ! scan git --log-opts="origin/main..refs/agent/head" . || literal "$RUNNER_TEMP/agent.patch"; then
+            echo "::error::Refusing to push: a commit on the agent branch contains something shaped like a credential."
+            exit 1
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Push the agent's branch
+        id: push
+        if: steps.check.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+        run: |
+          gh auth setup-git
+          # --exit-code returns 2 for a missing branch; anything else but 0 is
+          # an error, never a sign the branch is free.
+          rc=0
+          git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" > /dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::Refusing to push: $BRANCH already exists on GitHub and is never overwritten."
+            exit 1
+          elif [ "$rc" -ne 2 ]; then
+            echo "::error::Could not check whether $BRANCH exists on GitHub (git ls-remote exited $rc)."
+            exit 1
+          fi
+          # An empty lease only lets the push create the branch, so a branch
+          # created since the check is never updated, not even fast-forwarded.
+          git push --force-with-lease="refs/heads/$BRANCH:" origin "refs/agent/head:refs/heads/$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open the draft pull request
+        if: steps.push.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          BRANCH: ${{ steps.push.outputs.branch }}
+          TEXT: ${{ runner.temp }}/delivery/text
+          # Bash then counts characters, not bytes, when it shortens the title.
+          LC_ALL: C.UTF-8
+        run: |
+          title=""
+          if [ -f "$TEXT/pr-title.txt" ]; then
+            title=$(grep -m 1 -v '^[[:space:]]*$' "$TEXT/pr-title.txt" | tr -d '\r' || true)
+            title=${title:0:120}
+          fi
+          if [ -z "$title" ] || [ ! -s "$TEXT/pr.md" ]; then
+            # An agent that stopped after committing leaves no PR texts on
+            # purpose; its stop comment links the branch instead.
+            if [ -s "$TEXT/stop.md" ]; then
+              echo "No PR texts and a stop comment: the branch is linked from that comment."
+              exit 0
+            fi
+            echo "::error::The branch is pushed, but Claude did not write a title in .agent-run/pr-title.txt and .agent-run/pr.md. Open the PR by hand."
+            exit 1
+          fi
+          url=$(gh pr create --repo "$GITHUB_REPOSITORY" --draft --base main --head "$BRANCH" \
+            --title "$title" --body-file "$TEXT/pr.md")
+          comment="$RUNNER_TEMP/issue-comment.md"
+          printf 'PR en borrador: %s\n' "$url" > "$comment"
+          if [ -s "$TEXT/issue-comment.md" ]; then
+            printf '\n' >> "$comment"
+            cat "$TEXT/issue-comment.md" >> "$comment"
+          fi
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file "$comment"
+
+      - name: Post why Claude stopped
+        id: stop
+        if: steps.check.outputs.has_stop == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          STOP: ${{ runner.temp }}/delivery/text/stop.md
+          BRANCH: ${{ steps.push.outputs.branch }}
+          BRANCH_URL: ${{ github.server_url }}/${{ github.repository }}/tree/${{ steps.push.outputs.branch }}
+        run: |
+          comment="$RUNNER_TEMP/stop-comment.md"
+          cp "$STOP" "$comment"
+          if [ -n "$BRANCH" ]; then
+            printf '\nEl trabajo hecho hasta aquí está en la rama [%s](%s).\n' "\`$BRANCH\`" "$BRANCH_URL" >> "$comment"
+          fi
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file "$comment"
+          echo "posted=true" >> "$GITHUB_OUTPUT"
+
+      # Claude can end its turn early (for example after planning) and still
+      # report success. Fail unless this run pushed a branch or posted Claude's
+      # explanation of why it stopped.
+      - name: Check Claude delivered a branch or an explanation
+        env:
+          PUSHED: ${{ steps.push.outputs.branch }}
+          STOPPED: ${{ steps.stop.outputs.posted }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          if [ -z "$PUSHED" ] && [ "$STOPPED" != true ]; then
+            echo "::error::Claude finished without a branch for #$ISSUE or an explanation of why it stopped."
+            exit 1
+          fi
+
+      - name: Tell the issue if the run failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body "La implementación automática ha fallado antes de terminar. Log: $RUN_URL. Si el log dice que falta \`CLAUDE_CODE_OAUTH_TOKEN\` o que el token ha caducado, genera uno nuevo con \`claude setup-token\` y guárdalo como secret del repo. Si dice \"Refusing to push\", la rama del agente no pasó las comprobaciones (nombre, rutas protegidas o algo con forma de credencial en los commits o el texto) y no se ha subido nada. Para reintentar, quita y vuelve a poner la etiqueta \`agent:accepted\`."

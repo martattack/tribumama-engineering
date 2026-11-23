@@ -1,0 +1,61 @@
+name: Sentry triage
+
+# Files new Sentry errors (app and edge functions) as GitHub issues labelled
+# `source:sentry` plus `sentry:mobile` or `sentry:edge-function`. A person
+# reads them and labels the ones worth fixing `agent:accepted`, which starts
+# claude-implement.yml. No model runs here, so a quiet day costs nothing.
+
+on:
+  schedule:
+    # Every day 06:47 UTC (08:47/07:47 Madrid). Off the hour because scheduled
+    # runs at :00 are the ones GitHub delays most.
+    - cron: "47 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print what would be filed without touching GitHub"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sentry-triage
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Installs nothing, so a cache only adds exposure to a job with a token.
+    cache-mode: none
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.13.0
+          package-manager-cache: false
+
+      - name: Check the Sentry token secret is set
+        env:
+          TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Missing repository secret SENTRY_AUTH_TOKEN. Create a Sentry internal integration with org:read and event:read and store its token under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: File new Sentry errors as issues
+        run: node agent-workflows/sentry-triage.mjs
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          # Tunables, set as repository variables if the defaults ever chafe.
+          LOOKBACK: ${{ vars.SENTRY_TRIAGE_LOOKBACK || '2d' }}
+          MIN_EVENTS: ${{ vars.SENTRY_TRIAGE_MIN_EVENTS || '1' }}
+          MAX_NEW_ISSUES: ${{ vars.SENTRY_TRIAGE_MAX_NEW || '5' }}
