@@ -104,6 +104,26 @@ test("Sentry text outside fences stays in inline code, so the person labelling s
   assert.equal(sentryIdFromBody(body), issue.id);
 });
 
+test("scrubs tokens that are not inside a full URL", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+  const text = [
+    `Authorization: Bearer ${jwt}`,
+    `token=${jwt}`,
+    "apikey: sb_secret_Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56",
+    "invite chat.whatsapp.com/AbCdEf1234567890GhIjKl",
+    "blob 9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928",
+  ].join("\n");
+  const out = scrub(text);
+  assert.doesNotMatch(out, /eyJ|sb_secret|AbCdEf1234567890|9f8e7d6c5b4a/);
+  assert.match(out, /Bearer \[redacted\]/);
+  assert.match(out, /token=\[redacted\]/);
+});
+
+test("keeps only the endpoint of a Supabase path", () => {
+  assert.equal(redactUrl("https://x.supabase.co/rest/v1/tribe_members?user_id=eq.1"), "https://x.supabase.co/rest/v1/tribe_members");
+  assert.equal(redactUrl("https://x.supabase.co/storage/v1/object/sign/avatars/abc/photo.jpg"), "https://x.supabase.co/storage/v1/object");
+});
+
 test("titles stay short", () => {
   assert.ok(buildTitle({ ...issue, title: "x".repeat(300) }).length <= 120);
 });

@@ -198,7 +198,10 @@ jobs:
           # pushes). The Read denies keep the agent's own tools off runner
           # internals and the credential files in home; the rest of home stays
           # readable because the plugin skills read their own files from
-          # ~/.claude/plugins.
+          # ~/.claude/plugins. The Edit and Write denies on the runner, action
+          # and tool folders stop the agent's own tools (which the sandbox does
+          # not cover) from changing code that later steps in this job run,
+          # such as upload-artifact.
           #
           # Every Bash command runs in Claude Code's sandbox with no network
           # (an empty allowlist that is strict, so nothing is asked), without
@@ -261,7 +264,7 @@ jobs:
             --model opus
             --max-turns 200
             --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,Skill,Task,Agent,TodoWrite,TaskCreate,TaskUpdate,TaskList,TaskGet,Bash(npm run typecheck),Bash(npm run typecheck *),Bash(npm run lint),Bash(npm run lint *),Bash(npm run test),Bash(npm run test *),Bash(npx turbo test),Bash(npx turbo test *),Bash(npx jest *),Bash(npx eslint *),Bash(npx --yes supabase@2.106.0 migration new *),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git switch:*),Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git rev-parse:*),Bash(git branch:*),Bash(ls:*),Bash(mkdir:*),mcp__github__list_pull_requests"
-            --disallowedTools "Edit(.github/**),Write(.github/**),Edit(.git/**),Write(.git/**),Edit(.env*),Write(.env*),Edit(eas.json),Write(eas.json),Edit(**/vercel.*),Write(**/vercel.*),Edit(**/.vercel/**),Write(**/.vercel/**),Edit(**/.claude/settings*.json),Write(**/.claude/settings*.json),Read(//proc/**),Read(//sys/**),Read(//home/runner/runners/**),Read(//home/runner/work/_temp/**),Read(//home/runner/work/_actions/**),Read(~/.ssh/**),Read(~/.gnupg/**),Read(~/.config/**),Read(~/.docker/**),Read(~/.aws/**),Read(~/.azure/**),Read(~/.kube/**),Read(~/.npmrc),Read(~/.gitconfig),Read(~/.git-credentials),Read(~/.netrc),Read(~/.claude.json),Read(~/.claude/.credentials.json),Bash(npm run skills:*),Bash(git push),Bash(git push *),Bash(git fetch),Bash(git fetch *),Bash(git remote *),Bash(git config *),mcp__github__create_pull_request,mcp__github__add_issue_comment"
+            --disallowedTools "Edit(.github/**),Write(.github/**),Edit(.git/**),Write(.git/**),Edit(.env*),Write(.env*),Edit(eas.json),Write(eas.json),Edit(**/vercel.*),Write(**/vercel.*),Edit(**/.vercel/**),Write(**/.vercel/**),Edit(**/.claude/settings*.json),Write(**/.claude/settings*.json),Edit(//home/runner/runners/**),Write(//home/runner/runners/**),Edit(//home/runner/work/_temp/**),Write(//home/runner/work/_temp/**),Edit(//home/runner/work/_actions/**),Write(//home/runner/work/_actions/**),Edit(//home/runner/work/_tool/**),Write(//home/runner/work/_tool/**),Edit(//opt/hostedtoolcache/**),Write(//opt/hostedtoolcache/**),Read(//proc/**),Read(//sys/**),Read(//home/runner/runners/**),Read(//home/runner/work/_temp/**),Read(//home/runner/work/_actions/**),Read(~/.ssh/**),Read(~/.gnupg/**),Read(~/.config/**),Read(~/.docker/**),Read(~/.aws/**),Read(~/.azure/**),Read(~/.kube/**),Read(~/.npmrc),Read(~/.gitconfig),Read(~/.git-credentials),Read(~/.netrc),Read(~/.claude.json),Read(~/.claude/.credentials.json),Bash(npm run skills:*),Bash(git push),Bash(git push *),Bash(git fetch),Bash(git fetch *),Bash(git remote *),Bash(git config *),mcp__github__create_pull_request,mcp__github__add_issue_comment"
 
       # Everything after the agent in this job is treated as tainted (it could
       # have changed git config, PATH or this job's env files), which is why

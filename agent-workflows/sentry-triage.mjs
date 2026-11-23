@@ -64,12 +64,20 @@ function visible(text) {
   return `\`${flat || "?"}\``;
 }
 
-// Error messages and logs can quote whatever the code had in hand. Ids, emails
-// and phone numbers add nothing to a fix and should not land in GitHub.
+// Error messages and logs can quote whatever the code had in hand. Ids, emails,
+// phone numbers and credentials add nothing to a fix and should not land in
+// GitHub.
 export function scrub(text) {
   return String(text ?? "")
     .replace(/https?:\/\/[^\s"'<>)]+/g, redactUrl)
+    // A link written without a scheme keeps only its host, like redactUrl.
+    .replace(/(?<![\w/.@-])((?:[a-z0-9-]+\.)+[a-z]{2,})\/[^\s"'<>)]*/gi, "$1")
+    .replace(/\b(bearer)\s+[^\s"']+/gi, "$1 [redacted]")
+    .replace(/\b(token|access_token|refresh_token|api[_-]?key|apikey|key|secret|password|signature)(\s*[=:]\s*)[^\s"'&,;]+/gi, "$1$2[redacted]")
+    .replace(/eyJ[\w-]*\.[\w-]+\.[\w-]+/g, "[jwt]")
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "[uuid]")
+    // 32+ characters mixing letters and digits: keys and signatures, not names.
+    .replace(/(?<![\w-])(?=[\w-]*\d)(?=[\w-]*[A-Za-z])[\w-]{32,}(?![\w-])/g, "[token]")
     // A letter TLD keeps release names like app.tribumama.mobile@1.3.1 intact.
     .replace(/[\w.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, "[email]")
     // 9+ digits, optionally spaced or dashed: phones, not dates or versions.
@@ -78,12 +86,15 @@ export function scrub(text) {
 
 // A third-party path can be a secret on its own (a WhatsApp group invite is
 // chat.whatsapp.com/<code>), so other hosts keep only their origin. Supabase
-// paths name the endpoint that failed, which is worth keeping; ids in them are
-// scrubbed like any other text. Query strings never survive.
+// paths keep only the segments that name the endpoint that failed
+// (/rest/v1/<table>, /rest/v1/rpc/<fn>, /functions/v1/<name>); the rest can be
+// a signed storage path. Query strings never survive.
 export function redactUrl(url) {
   try {
     const parsed = new URL(url);
-    return parsed.hostname.endsWith(".supabase.co") ? `${parsed.origin}${parsed.pathname}` : parsed.origin;
+    if (!parsed.hostname.endsWith(".supabase.co")) return parsed.origin;
+    const parts = parsed.pathname.split("/");
+    return `${parsed.origin}${parts.slice(0, parts[3] === "rpc" ? 5 : 4).join("/")}`;
   } catch {
     return "[url]";
   }
